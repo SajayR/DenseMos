@@ -1,204 +1,291 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import HubertModel
-from typing import Tuple, List, Optional
 
-class DenseAVTokenized(nn.Module):
-    def __init__(
-        self,
-        token_embed_dim: int = 1024,
-        num_visual_tokens: int = 1024,  # 32*32
-        vocab_size: int = 65536,  # Cosmos vocab size
-        hubert_model: Optional[HubertModel] = None
-    ):
+import transformers
+from transformers import HubertModel, AutoProcessor
+
+class AudioEmbedder(nn.Module):
+    def __init__(self, embedding_dim=1024):
         super().__init__()
         
-        # Token embedding for Cosmos tokens
-        self.token_embedding = nn.Embedding(vocab_size, token_embed_dim)
+        # Load pretrained HuBERT and processor
+        self.processor = AutoProcessor.from_pretrained("facebook/hubert-large-ls960-ft")
+        self.hubert = HubertModel.from_pretrained("facebook/hubert-large-ls960-ft")
         
-        # HuBERT model
-        self.hubert = hubert_model or HubertModel.from_pretrained("facebook/hubert-large-ls960-ft")
+        # Project HuBERT features (1024 for large model) to desired embedding dimension
+        self.projection = nn.Linear(1024, embedding_dim)  
         
-        # Projections if needed
-        self.token_projection = nn.Linear(token_embed_dim, token_embed_dim)
-        self.audio_projection = nn.Linear(1024, token_embed_dim)  # HuBERT dim -> token_embed_dim
-        
-    def split_features(self, visual_features: torch.Tensor, audio_features: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, audio_input):
         """
-        Split features into 3 second-long segments
-        
         Args:
-            visual_features: (B, 9, 32, 32)
-            audio_features: (B, 150, 1024)
+            audio_input: (B, T) raw audio waveform at 16kHz
             
         Returns:
-            Tuple of:
-                visual_splits: (B, 3, 3, 32, 32)
-                audio_splits: (B, 3, 50, 1024)
+            features: (B, Na, D) where:
+                B is batch size
+                Na is number of audio tokens
+                D is embedding_dim
         """
-        B = visual_features.shape[0]
+        # Process audio through HuBERT processor
+        #print(f"Audio input shape: {audio_input.shape}")
+        inputs = self.processor(
+            audio_input, 
+            return_tensors="pt",
+            sampling_rate=16000,
+            padding=True,
+            return_attention_mask=True
+        ).input_values.squeeze(0)
+        #print(f"Inputs shape: {inputs.shape}")
         
-        # Split visual features
-        visual_splits = visual_features.view(B, 3, 3, 32, 32)
+        # Move to same device as model
+        inputs = inputs.to(audio_input.device)
         
-        # Split audio features - 150 -> 3 segments of 50
-        audio_splits = audio_features.view(B, 3, 50, -1)
+        # Get HuBERT features
+        with torch.no_grad():
+            hubert_output = self.hubert(inputs).last_hidden_state  # (B, T/320, 1024)
         
-        return visual_splits, audio_splits
+        # Project to embedding dimension
+        features = self.projection(hubert_output)  # (B, T/320, embedding_dim)
         
-    def select_random_frames(self, visual_splits: torch.Tensor) -> torch.Tensor:
-        """
-        Randomly select one frame from each second-segment of visual features
-        
-        Args:
-            visual_splits: (B, 3, 3, 32, 32) # B, num_segments, frames_per_segment, H, W
-            
-        Returns:
-            selected_frames: (B, 3, 1, 32, 32) # One frame per segment
-        """
-        B = visual_splits.shape[0]
-        device = visual_splits.device
-        
-        # Generate random indices for each batch and segment
-        random_indices = torch.randint(0, 3, (B, 3, 1), device=device)
-        
-        # Create proper indexing tensors
-        batch_idx = torch.arange(B, device=device).view(B, 1, 1).expand(B, 3, 1)
-        segment_idx = torch.arange(3, device=device).view(1, 3, 1).expand(B, 3, 1)
-        
-        # Select random frames
-        selected_frames = visual_splits[batch_idx, segment_idx, random_indices]
-        
-        return selected_frames  # (B, 3, 1, 32, 32)
+        return features
 
-    def embed_visual_tokens(self, visual_tokens: torch.Tensor) -> torch.Tensor:
-        """
-        Embed and project visual tokens
+class VisualEmbedder(nn.Module):
+    def __init__(self, num_tokens=65536, embedding_dim=1024):  # Cosmos uses 64K vocab
+        super().__init__()
         
+        # Token embedding
+        self.token_embedding = nn.Embedding(num_tokens, embedding_dim)
+        
+        # 2D positional encoding
+        self.pos_embedding = nn.Parameter(torch.randn(1, 32*32, embedding_dim))
+        
+    def forward(self, token_indices):
+        """
         Args:
-            visual_tokens: (B, 3, 1, 32, 32) 
+            token_indices: (B, H, W) tensor of Cosmos token indices
             
         Returns:
-            token_embeddings: (B, 3, 1024, 1024) # B, segments, num_tokens (flattened 32*32), embedding_dim
+            features: (B, H*W, D) embedded tokens with positional encoding
         """
-        B = visual_tokens.shape[0]
-        
-        # Flatten spatial dimensions
-        flat_tokens = visual_tokens.view(B, 3, -1)  # (B, 3, 1024)
+        B, H, W = token_indices.shape
         
         # Embed tokens
-        token_embeddings = self.token_embedding(flat_tokens)  # (B, 3, 1024, embed_dim)
+        tokens = self.token_embedding(token_indices)  # (B, H, W, D)
+        tokens = tokens.view(B, H*W, -1)  # (B, H*W, D)
         
-        # Project if needed
-        token_embeddings = self.token_projection(token_embeddings)  # (B, 3, 1024, 1024)
+        # Add positional embeddings
+        tokens = tokens + self.pos_embedding
         
-        return token_embeddings
+        return tokens
+
+
+class AudioVisualModel(nn.Module):
+    def __init__(self, temperature=0.2):
+        super().__init__()
+        
+        self.visual_embedder = VisualEmbedder()
+        self.audio_embedder = AudioEmbedder()
+        self.temperature = nn.Parameter(torch.tensor(temperature))
+        
+    def compute_similarity_matrix(self, audio_feats, visual_feats): #ye take this
+        """
+        Compute pairwise cosine similarities between audio and visual tokens
+        
+        Args:
+            audio_feats: (B, Na, D)  # B=batch, Na=num_audio_tokens, D=embedding_dim
+            visual_feats: (B, Nv, D) # Nv=num_visual_tokens
+            
+        Returns:
+            similarity_matrix: (B, Na, Nv)
+        """
+        # Normalize embeddings
+        #print("Audio feats stats before norm - min:", audio_feats.min().item(), "max:", audio_feats.max().item())
+        #print("Visual feats stats before norm - min:", visual_feats.min().item(), "max:", visual_feats.max().item())
+        
+        # Normalize embeddings
+        audio_feats = F.normalize(audio_feats, dim=-1)
+        visual_feats = F.normalize(visual_feats, dim=-1)
+        
+        # Compute similarities and check values
+        similarity = torch.bmm(audio_feats, visual_feats.transpose(1, 2))
+        #print("Raw similarity stats - min:", similarity.min().item(),
+          #  "max:", similarity.max().item())
+        
+        return similarity / self.temperature
     
-    def calculate_similarity(
-        self, 
-        visual_embeddings: torch.Tensor,  # (B, 3, 1024, 1024)
-        audio_features: torch.Tensor,     # (B, 3, 50, 1024)
-    ) -> torch.Tensor:
+    def aggregate_token_similarities(self, similarity_matrix): #also take this
         """
-        Calculate similarity between visual and audio features for each segment
-        Returns similarity scores for each batch item
+        Aggregate token-level similarities using max-mean strategy
+        
+        Args:
+            similarity_matrix: (B, Na, Nv)
+            
+        Returns:
+            clip_similarity: (B)
         """
-        B = visual_embeddings.shape[0]
+        # Max pool over visual dimension for each audio token
+        max_similarities = torch.max(similarity_matrix, dim=2)[0]  # (B, Na)
         
-        # Compute dot product between visual and audio features
-        # For each segment in batch:
-        # visual_embeddings: (1024, 1024) @ audio_features: (50, 1024).T
-        # = (1024, 50)
-        similarities = torch.matmul(
-            visual_embeddings,  # (B, 3, 1024, 1024)
-            audio_features.transpose(-1, -2)  # (B, 3, 1024, 50)
-        )  # Result: (B, 3, 1024, 50)
+        # Average over audio tokens
+        clip_similarity = torch.mean(max_similarities, dim=1)  # (B)
+        return clip_similarity
+    
+    def compute_all_similarities(self, audio_feats, visual_feats):
+        """Compute similarities between all pairs of audio and visual features in batch"""
+        B = audio_feats.shape[0]
         
-        # Max pool over visual tokens
-        token_maxpool = torch.max(similarities, dim=2)[0]  # (B, 3, 50)
+        audio_feats = audio_feats.unsqueeze(1).expand(-1, B, -1, -1)
+        visual_feats = visual_feats.unsqueeze(0).expand(B, -1, -1, -1)
         
-        # Average over audio temporal dimension
-        segment_scores = torch.mean(token_maxpool, dim=2)  # (B, 3)
+        # Normalize features
+        audio_feats = F.normalize(audio_feats, dim=-1)
+        visual_feats = F.normalize(visual_feats, dim=-1)
         
-        return segment_scores  # (B, 3)
+        # Compute token-level similarities
+        token_sims = torch.matmul(
+            audio_feats, 
+            visual_feats.transpose(2, 3)
+        ) / self.temperature
+        
+        # Aggregate using max-mean strategy
+        max_sims = torch.max(token_sims, dim=3)[0]  # Max over visual dimension (B, B, Na)
+        clip_sims = torch.mean(max_sims, dim=2)     # Mean over audio dimension (B, B)
+        
+        return clip_sims, token_sims
 
-    def forward(self, visual_tokens: torch.Tensor, audio_raw: torch.Tensor, training: bool = True):
-        """
-        Full forward pass including similarity calculation
-        """
-        # Previous steps remain the same...
-        # Pass audio through HuBERT
-        audio_features = self.hubert(audio_raw).last_hidden_state  # (B, 150, 1024)
-        audio_features = self.audio_projection(audio_features)  # (B, 150, 1024)
+    def compute_contrastive_loss(self, clip_similarities, token_sims):
+        """Compute InfoNCE loss with regularization"""
+        batch_size = clip_similarities.shape[0]
+        labels = torch.arange(batch_size).to(clip_similarities.device)
         
-        # Split features
-        visual_splits, audio_splits = self.split_features(visual_tokens, audio_features)
+        # Audio to Visual direction
+        log_prob_a2v = F.log_softmax(clip_similarities, dim=1)
+        losses_a2v = -log_prob_a2v[torch.arange(batch_size), labels]
         
-        if training:
-            # Get random frames and embeddings
-            selected_frames = self.select_random_frames(visual_splits)
-            visual_embeddings = self.embed_visual_tokens(selected_frames)
+        # Visual to Audio direction  
+        log_prob_v2a = F.log_softmax(clip_similarities.t(), dim=1)
+        losses_v2a = -log_prob_v2a[torch.arange(batch_size), labels]
+        
+        # Average both directions
+        contrastive_loss = (losses_a2v + losses_v2a).mean() / 2
+        
+        # Add regularization
+        reg_loss = self.compute_regularization_losses(clip_similarities, token_sims)
+        
+        total_loss = contrastive_loss + reg_loss
+        
+        return total_loss
+    
+    def compute_regularization_losses(self, clip_sims, token_sims):
+        """Compute essential regularization terms:
+        1. Non-negative pressure - encourage positive evidence
+        2. Temperature stability - prevent collapse"""
+        
+        # Non-negative pressure on token similarities
+        neg_sims = torch.clamp(token_sims, max=0)  
+        l_nonneg = torch.mean(neg_sims ** 2)
+        
+        # Temperature/Calibration stability
+        l_cal = torch.clamp(torch.log(torch.tensor(1.0, device=token_sims.device)) - 
+                        torch.log(self.temperature), min=0) ** 2
+        
+        # Combine with smaller weights since we removed the other terms
+        reg_loss = 0.01 * l_nonneg + 0.1 * l_cal
+                    
+        return reg_loss
+        
+    def forward(self, frames, audio):
+        """
+        Forward pass computing embeddings, similarities and loss
+        
+        Args:
+            frames: (B, 1, H, W) batch of video frames from cosmos tokenizer #should be (b, 32, 32)
+            audio: (B, T) batch of audio features #should be (b, 16331)
             
-            # Calculate similarity scores
-            similarity_scores = self.calculate_similarity(visual_embeddings, audio_splits)
-            
-            # similarity_scores will be (B, 3) where each value represents
-            # how well the audio and visual features match for each segment
-            return similarity_scores
+        Returns:
+            loss if training, clip_similarities if not
+        """
+        # Get embeddings
+        visual_feats = self.visual_embedder(frames)
+        audio_feats = self.audio_embedder(audio)
+        
+        if self.training:
+            # Get similarities and token-level similarities
+            clip_sims, token_sims = self.compute_all_similarities(audio_feats, visual_feats)
+            return self.compute_contrastive_loss(clip_sims, token_sims)
         else:
-            # For inference, we might want to return the full similarity maps
-            # We'll implement this separately
-            pass
+            # During inference, just get clip similarities
+            token_sims = self.compute_similarity_matrix(audio_feats, visual_feats) #(B, Na, Nv)
+            #should be reshaped into (B, Na, 32, 32) to bring back to original shape
+            B, Na, Nv = token_sims.shape
+            token_sims = token_sims.view(B, Na, 32, 32)
+            return token_sims
+        
 
-
+def test_contrastive_loss():
+    # Create a sample similarity matrix where diagonal (matching pairs)
+    # should have higher values (closer to 1) than non-matching pairs
+    #clip_sims = torch.tensor([
+    #    [0.8, 0.2, 0.1],  # audio0 matches best with visual0
+    #    [0.3, 0.9, 0.2],  # audio1 matches best with visual1
+    #    [0.2, 0.1, 0.7]   # audio2 matches best with visual2
+    #])
+    clip_sims = torch.tensor([
+        [0, 0, 1.0],  # audio0 matches best with visual0
+        [1.0, 0, 0],  # audio1 matches best with visual1
+        [1.0, 0, 0]   # audio2 matches best with visual2
+    ])
+    
+    batch_size = 3
+    labels = torch.arange(batch_size)
+    
+    # Audio to Visual direction
+    print("1. Raw similarities:")
+    print(clip_sims)
+    
+    print("\n2. After log_softmax along dim=1 (audio to visual):")
+    log_prob_a2v = F.log_softmax(clip_sims, dim=1)
+    print(log_prob_a2v)
+    
+    print("\n3. Selecting diagonal elements (correct pairs):")
+    losses_a2v = -log_prob_a2v[torch.arange(batch_size), labels]
+    print(losses_a2v)
+    
+    # Visual to Audio direction
+    print("\n4. Transposed similarities (visual to audio):")
+    print(clip_sims.t())
+    
+    print("\n5. After log_softmax along dim=1 (visual to audio):")
+    log_prob_v2a = F.log_softmax(clip_sims.t(), dim=1)
+    print(log_prob_v2a)
+    
+    print("\n6. Selecting diagonal elements again:")
+    losses_v2a = -log_prob_v2a[torch.arange(batch_size), labels]
+    print(losses_v2a)
+    
+    # Final loss
+    contrastive_loss = (losses_a2v + losses_v2a).mean() / 2
+    print("\n7. Final contrastive loss:", contrastive_loss.item())
 
 if __name__ == "__main__":
-    # Create dummy model
-    model = DenseAVTokenized()
-    model.eval()  # Prevent HuBERT from complaining about batch norm
+    # Test the model
+    model = AudioVisualModel()
     
     # Create dummy batch
-    B = 2  # batch size
+    batch_size = 4
+    frames = torch.randint(0, 65536, (batch_size, 32, 32))
+    audio = torch.randn(batch_size, 16331)
+
+    # Test training mode
+    loss = model(frames, audio)
+    print(f"Training loss: {loss.item()}")
     
-    # Create dummy visual tokens (B, 9, 32, 32)
-    visual_tokens = torch.randint(0, 65536, (B, 9, 32, 32))
-    print(f"Visual tokens shape: {visual_tokens.shape}")
-    # Create dummy audio (B, audio_len)
-    audio_raw = torch.randn(B, 48281)  # 3 seconds at 16kHz
-    print(f"Audio raw shape: {audio_raw.shape}")
-    
-    
-    print("\n=== Testing Feature Splitting ===")
-    # First test split_features
+    # Test inference mode
+    model.eval()
     with torch.no_grad():
-        audio_features = model.hubert(audio_raw).last_hidden_state
-        visual_splits, audio_splits = model.split_features(visual_tokens, audio_features)
-    
-    print(f"Visual splits shape: {visual_splits.shape}")  # Should be (B, 3, 3, 32, 32)
-    print(f"Audio splits shape: {audio_splits.shape}")    # Should be (B, 3, 50, 1024)
-    
-    print("\n=== Testing Random Frame Selection ===")
-    # Test random frame selection
-    selected_frames = model.select_random_frames(visual_splits)
-    print(f"Selected frames shape: {selected_frames.shape}")  # Should be (B, 3, 1, 32, 32)
-    
-    print("\n=== Testing Visual Token Embedding ===")
-    # Test token embedding
-    visual_embeddings = model.embed_visual_tokens(selected_frames)
-    print(f"Visual embeddings shape: {visual_embeddings.shape}")  # Should be (B, 3, 1024, 1024)
-    
-    print("\n=== Testing Full Forward Pass ===")
-    # Test full forward pass
-    with torch.no_grad():
-        outputs = model(visual_tokens, audio_raw)
-        print("Forward pass successful!")
+        similarities = model(frames, audio)
+        print(f"Inference similarities shape: {similarities.shape}")  # Should be (batch_size)
         
-    # Basic sanity checks
-    print("\n=== Running Sanity Checks ===")
-    assert visual_splits.shape == (B, 3, 3, 32, 32), "Wrong visual split shape!" #3 seconds, 3 frames for each seconds
-    assert audio_splits.shape[:-1] == (B, 3, 50), "Wrong audio split shape!" # 3 seconds, 50 features
-    assert selected_frames.shape == (B, 3, 1, 32, 32), "Wrong selected frames shape!" # 3 seconds, 1 frame for each seconds
-    assert visual_embeddings.shape == (B, 3, 1024, 1024), "Wrong embedding shape!" # 3 seconds, 1024 tokens, 1024 embedding dim
     
-    print("All tests passed! 🎉")
+    
