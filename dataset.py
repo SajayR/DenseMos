@@ -10,12 +10,29 @@ import torchaudio.transforms as T
 from cosmos_tokenizer.video_lib import CausalVideoTokenizer
 import warnings
 warnings.filterwarnings("ignore")
-from hubert_processor import extract_audio_from_video
-from cosmos import encode_video
+#from hubert_processor import extract_audio_from_video
 import multiprocessing
 from tqdm import tqdm
 import torchvision
 multiprocessing.set_start_method('spawn', force=True)
+import av
+
+def extract_audio_from_video(video_path: Path) -> torch.Tensor:
+    """Extract audio from video file and return as tensor."""
+    container = av.open(str(video_path))
+    audio = container.streams.audio[0]
+    resampler = av.audio.resampler.AudioResampler(format='s16', layout='mono', rate=16000)
+    
+    # Read all audio frames
+    samples = []
+    for frame in container.decode(audio):
+        frame.pts = None
+        frame = resampler.resample(frame)[0]
+        samples.append(frame.to_ndarray().reshape(-1))
+    
+    samples = torch.tensor(np.concatenate(samples))
+    samples = samples.float() / 32768.0  # Convert to float and normalize
+    return samples
 
 class VideoBatchSampler(Sampler):
     def __init__(self, vid_nums: List[int], batch_size: int):
@@ -126,12 +143,12 @@ cosmos_encoder = CausalVideoTokenizer(
 import random
 def collate_fn(batch):
     # Stack all video frames
-    frames = torch.stack([item['frames'] for item in batch])
+    frames = torch.stack([item['frames'][:, :12, :, :] for item in batch])
     
     # Process through Cosmos as a batch
     #with torch.cuda.amp.autocast():  # Optional: use mixed precision
-    print("Encoding video frames...")
-    print("Of shape",frames.shape)
+    #print("Encoding video frames...")
+    #print("Of shape",frames.shape)
     video_tokens = cosmos_encoder.encode(frames.to('cuda'))[0]
     video_tokens = video_tokens[:, 1:, :, :]  # Drop first frame as before
     #taking a random frame 

@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+import math
 import transformers
 from transformers import HubertModel, AutoProcessor
 
@@ -154,7 +154,7 @@ class AudioVisualModel(nn.Module):
         
         return clip_sims, token_sims
 
-    def compute_contrastive_loss(self, clip_similarities, token_sims):
+    '''def compute_contrastive_loss(self, clip_similarities, token_sims):
         """Compute InfoNCE loss with regularization"""
         batch_size = clip_similarities.shape[0]
         labels = torch.arange(batch_size).to(clip_similarities.device)
@@ -172,6 +172,32 @@ class AudioVisualModel(nn.Module):
         
         # Add regularization
         reg_loss = self.compute_regularization_losses(clip_similarities, token_sims)
+        
+        total_loss = contrastive_loss + reg_loss
+        
+        return total_loss'''
+    
+    def compute_contrastive_loss(self, clip_similarities, token_sims):
+        """Compute InfoNCE loss with regularization"""
+        batch_size = clip_similarities.shape[0]
+        labels = torch.arange(batch_size).to(clip_similarities.device)
+        
+        # Scale the similarities by sqrt(batch_size)
+        scaled_sims = clip_similarities / math.sqrt(batch_size)
+        
+        # Audio to Visual direction
+        log_prob_a2v = F.log_softmax(scaled_sims, dim=1)
+        losses_a2v = -log_prob_a2v[torch.arange(batch_size), labels]
+        
+        # Visual to Audio direction  
+        log_prob_v2a = F.log_softmax(scaled_sims.t(), dim=1)
+        losses_v2a = -log_prob_v2a[torch.arange(batch_size), labels]
+        
+        # Average both directions
+        contrastive_loss = (losses_a2v + losses_v2a).mean() / 2
+        
+        # Add regularization
+        reg_loss = self.compute_regularization_losses(scaled_sims, token_sims)
         
         total_loss = contrastive_loss + reg_loss
         
@@ -194,6 +220,28 @@ class AudioVisualModel(nn.Module):
         reg_loss = 0.01 * l_nonneg + 0.1 * l_cal
                     
         return reg_loss
+    
+    '''def compute_regularization_losses(self, clip_sims, token_sims):
+        """Compute essential regularization terms:
+        1. Non-negative pressure - encourage positive evidence
+        2. Temperature stability - keep temperature in good range"""
+        
+        # Non-negative pressure on token similarities
+        neg_sims = torch.clamp(token_sims, max=0)  
+        l_nonneg = torch.mean(neg_sims ** 2)
+        
+        # Temperature/Calibration stability
+        # Penalize if temp goes below 0.07 or above 0.2
+        l_cal_lower = torch.clamp(torch.log(torch.tensor(0.07, device=token_sims.device)) - 
+                        torch.log(self.temperature), min=0) ** 2
+        l_cal_upper = torch.clamp(torch.log(self.temperature) - 
+                        torch.log(torch.tensor(0.2, device=token_sims.device)), min=0) ** 2
+        l_cal = l_cal_lower + l_cal_upper
+        
+        # Combine with smaller weights
+        reg_loss = 0.01 * l_nonneg + 0.1 * l_cal
+                    
+        return reg_loss'''
         
     def forward(self, frames, audio):
         """
@@ -285,7 +333,7 @@ if __name__ == "__main__":
     model.eval()
     with torch.no_grad():
         similarities = model(frames, audio)
-        print(f"Inference similarities shape: {similarities.shape}")  # Should be (batch_size)
+        print(f"Inference similarities shape: {similarities.shape}")  # Should be (batch_size, Na, 32, 32)
         
     
     
