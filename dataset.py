@@ -145,7 +145,7 @@ def collate_fn(batch):
     # Stack all video frames
     frames = torch.stack([item['frames'][:, :12, :, :] for item in batch])
     
-    # Process through Cosmos as a batch
+    # as a batch
     #with torch.cuda.amp.autocast():  # Optional: use mixed precision
     #print("Encoding video frames...")
     #print("Of shape",frames.shape)

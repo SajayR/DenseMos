@@ -81,7 +81,7 @@ class VisualEmbedder(nn.Module):
 
 
 class AudioVisualModel(nn.Module):
-    def __init__(self, temperature=0.2):
+    def __init__(self, temperature=0.9):
         super().__init__()
         
         self.visual_embedder = VisualEmbedder()
@@ -198,7 +198,7 @@ class AudioVisualModel(nn.Module):
         
         # Add regularization
         reg_loss = self.compute_regularization_losses(scaled_sims, token_sims)
-        
+        #print(f"Contrastive loss: {contrastive_loss.item()}, Regularization loss: {reg_loss.item()}")
         total_loss = contrastive_loss + reg_loss
         
         return total_loss
