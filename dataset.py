@@ -70,10 +70,12 @@ class VideoBatchSampler(Sampler):
 class AudioVisualDataset(Dataset):
     def __init__(self, data_root: str, sample_fps: int = 12):
         self.data_root = Path(data_root)
+        self.cache_dir = Path("cosmos_cache")
+        self.cache_dir.mkdir(exist_ok=True)
         self.sample_fps = sample_fps
         self.video_files = sorted(list(self.data_root.glob("*.mp4")))
         
-        # Create vid_num mapping
+        # Create vid_num mapping (same as before)
         self.vid_to_files = {}
         for file in self.video_files:
             vid_num = int(file.stem.split('_')[0])
@@ -82,19 +84,80 @@ class AudioVisualDataset(Dataset):
             self.vid_to_files[vid_num].append(file)
             
         self.vid_nums = [int(f.stem.split('_')[0]) for f in self.video_files]
+        
+        # Initialize cache if needed
+        self._initialize_cache()
+
+    def _initialize_cache(self, batch_size=64):
+        """Pre-compute and cache Cosmos encodings if not already cached, with batched processing"""
+        # First check which videos need encoding
+        uncached_videos = []
+        for video_path in tqdm(self.video_files, desc="Checking for uncached videos"):
+            cache_path = self.cache_dir / f"{video_path.stem}_tokens.pt"
+            if not cache_path.exists():
+                uncached_videos.append(video_path)
+        
+        if not uncached_videos:
+            print("All videos already cached!")
+            return
+            
+        print(f"Need to cache {len(uncached_videos)} videos")
+        
+        # Initialize encoder
+        cosmos_encoder = CausalVideoTokenizer(
+            checkpoint_enc=f'pretrained_ckpts/Cosmos-Tokenizer-DV4x8x8/encoder.jit'
+        ).to('cuda')
+        
+        # Process in batches
+        for i in tqdm(range(0, len(uncached_videos), batch_size), desc="Caching Cosmos encodings"):
+            batch_videos = uncached_videos[i:i + batch_size]
+            if i == 0:
+                print(batch_videos)
+
+            # Load and preprocess batch
+            batch_frames = []
+            for video_path in batch_videos:
+                frames = load_and_preprocess_video(video_path, self.sample_fps)
+                frames = frames[:, :12, :, :]  # Limit to 12 frames as in collate_fn
+                batch_frames.append(frames)
+            
+            # Stack into batch
+            batch_frames = torch.stack(batch_frames)
+            
+            # Encode batch
+            #with torch.no_grad():
+            batch_tokens = cosmos_encoder.encode(batch_frames.to('cuda'))[0]
+            batch_tokens = batch_tokens[:, 1:, :, :]  # Drop first frame
+            
+
+            if i == 0:
+                print(batch_tokens.shape)
+            # Save individual results
+            for idx, video_path in enumerate(batch_videos):
+                cache_path = self.cache_dir / f"{video_path.stem}_tokens.pt"
+                torch.save(batch_tokens[idx].cpu(), cache_path)
+                
+            # Optional: Clear CUDA cache periodically
+            if i % (batch_size * 100) == 0:
+                torch.cuda.empty_cache()
+        
+        del cosmos_encoder  # Free up GPU memory
+        torch.cuda.empty_cache()
 
     def __len__(self):
         return len(self.video_files)
 
     def __getitem__(self, idx):
         video_path = self.video_files[idx]
-        # Return raw video frames and audio
-        # We'll process through Cosmos in collate_fn
-        frames = load_and_preprocess_video(video_path, self.sample_fps)
+        # Load cached tokens
+        cache_path = self.cache_dir / f"{video_path.stem}_tokens.pt"
+        tokens = torch.load(cache_path)
+        
         audio = extract_audio_from_video(video_path)
         
         return {
-            'frames': frames,
+            'video_path': video_path,
+            'video_tokens': tokens,  # Now pre-loaded from cache
             'audio': audio,
             'vid_num': int(video_path.stem.split('_')[0]),
             'segment_num': int(video_path.stem.split('_')[1])
@@ -140,27 +203,20 @@ def load_and_preprocess_video(video_path: str, sample_fps: int) -> torch.Tensor:
 cosmos_encoder = CausalVideoTokenizer(
     checkpoint_enc=f'pretrained_ckpts/Cosmos-Tokenizer-DV4x8x8/encoder.jit'
 ).to('cuda')
+
 import random
+
 def collate_fn(batch):
-    # Stack all video frames
-    frames = torch.stack([item['frames'][:, :12, :, :] for item in batch])
+    # Get all tokens (already processed)
+    video_tokens = torch.stack([item['video_tokens'] for item in batch])
+    # Take a random frame from each video's tokens
+    video_tokens = video_tokens[:, random.randint(0, video_tokens.shape[1]-1), :, :]
     
-    # as a batch
-    #with torch.cuda.amp.autocast():  # Optional: use mixed precision
-    #print("Encoding video frames...")
-    #print("Of shape",frames.shape)
-    video_tokens = cosmos_encoder.encode(frames.to('cuda'))[0]
-    video_tokens = video_tokens[:, 1:, :, :]  # Drop first frame as before
-    #taking a random frame 
-    video_tokens=video_tokens[:,random.randint(0,video_tokens.shape[1]-1) , :, :]
-    
-    # Pad audio sequences
+    # Pad audio sequences (same as before)
     max_audio_len = max(item['audio'].shape[0] for item in batch)
     audio_padded = torch.zeros(len(batch), max_audio_len)
     for i, item in enumerate(batch):
         audio_len = item['audio'].shape[0]
-        #print(audio_len)
-        #shouldnt really ever need to pad audio, just in case
         audio_padded[i, :audio_len] = item['audio']
     
     return {

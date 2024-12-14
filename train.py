@@ -41,7 +41,7 @@ def train(
         checkpoint_interval: int = 1000,
         num_viz_samples: int = 5,
         resume_training: bool = True,  # New parameter to control checkpoint loading
-        do_wandb: bool = True
+        do_wandb: bool = False
         ):
     
     # Find latest checkpoint if we want to resume
